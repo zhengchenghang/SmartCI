@@ -7,6 +7,7 @@ require (
 	github.com/go-git/go-git/v5 v5.11.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/sashabaranov/go-openai v1.41.2
+	gopkg.in/yaml.v3 v3.0.1
 
 )
 
