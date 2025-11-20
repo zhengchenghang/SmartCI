@@ -30,6 +30,8 @@ type Engine struct {
     mu          sync.Mutex
     running     bool
     taskStatus  map[string]bool // 任务运行状态
+    taskEntries map[string]cron.EntryID // 任务cron entry ID映射
+    shutdownChan chan struct{} // 服务器关闭信号
 }
 
 type Server struct {
@@ -63,6 +65,8 @@ func NewEngine(cfg config.Config) *Engine {
         agent:        aiAgent,
         cron:         cron.New(),
         taskStatus:   make(map[string]bool),
+        taskEntries:  make(map[string]cron.EntryID),
+        shutdownChan: make(chan struct{}),
     }
 }
 
@@ -160,16 +164,21 @@ func (e *Engine) StartCron() {
     for _, task := range e.cfg.BashTasks {
         if task.Schedule != "" {
             taskName := task.Name // 创建局部变量避免闭包问题
-            e.cron.AddFunc(task.Schedule, func() {
+            entryID, err := e.cron.AddFunc(task.Schedule, func() {
                 e.TriggerBashTask(taskName)
             })
-            log.Printf("📅 已注册Bash任务: %s (%s)", taskName, task.Schedule)
+            if err != nil {
+                log.Printf("❌ 注册Bash任务失败: %s, 错误: %v", taskName, err)
+                continue
+            }
+            e.taskEntries[taskName] = entryID
+            log.Printf("📅 已注册Bash任务: %s (%s) [ID: %d]", taskName, task.Schedule, entryID)
         }
     }
     
     e.cron.Start()
     e.running = true
-    log.Printf("✅ Cron调度器已启动")
+    log.Printf("✅ Cron调度器已启动，共注册 %d 个周期性Bash任务", len(e.taskEntries))
 }
 
 func (e *Engine) StopCron() {
@@ -185,26 +194,98 @@ func (e *Engine) StopCron() {
     }
 }
 
+// StopBashTask 停止指定的周期性Bash任务
+func (e *Engine) StopBashTask(taskName string) error {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+    
+    entryID, exists := e.taskEntries[taskName]
+    if !exists {
+        return fmt.Errorf("任务 '%s' 没有注册周期性调度", taskName)
+    }
+    
+    // 从cron中移除任务
+    e.cron.Remove(entryID)
+    delete(e.taskEntries, taskName)
+    
+    log.Printf("🛑 已停止周期性Bash任务: %s [ID: %d]", taskName, entryID)
+    return nil
+}
+
+// StartBashTask 启动指定的周期性Bash任务
+func (e *Engine) StartBashTask(taskName string) error {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+    
+    // 检查任务是否已经在运行
+    if _, exists := e.taskEntries[taskName]; exists {
+        return fmt.Errorf("任务 '%s' 已经在周期性运行中", taskName)
+    }
+    
+    // 查找任务配置
+    var targetTask config.BashTaskConfig
+    found := false
+    for _, task := range e.cfg.BashTasks {
+        if task.Name == taskName {
+            targetTask = task
+            found = true
+            break
+        }
+    }
+    if !found {
+        return fmt.Errorf("未找到Bash任务配置: %s", taskName)
+    }
+    
+    if targetTask.Schedule == "" {
+        return fmt.Errorf("任务 '%s' 没有配置周期性调度", taskName)
+    }
+    
+    // 添加到cron调度
+    entryID, err := e.cron.AddFunc(targetTask.Schedule, func() {
+        e.TriggerBashTask(taskName)
+    })
+    if err != nil {
+        return fmt.Errorf("注册Bash任务失败: %v", err)
+    }
+    
+    e.taskEntries[taskName] = entryID
+    log.Printf("📅 已启动周期性Bash任务: %s (%s) [ID: %d]", taskName, targetTask.Schedule, entryID)
+    return nil
+}
+
 func (e *Engine) GetTaskStatus(taskName string) map[string]interface{} {
     e.mu.Lock()
     defer e.mu.Unlock()
 
     if taskName != "" {
         status, exists := e.taskStatus[taskName]
+        isScheduled, scheduled := e.taskEntries[taskName]
         return map[string]interface{}{
-            "task_name": taskName,
-            "running":   exists && status,
+            "task_name":   taskName,
+            "running":     exists && status,
+            "scheduled":   scheduled,
+            "schedule_id": isScheduled,
         }
     }
 
     // 返回所有任务状态
     status := make(map[string]bool)
+    scheduled := make(map[string]bool)
+    scheduleIds := make(map[string]int)
+    
     for name, running := range e.taskStatus {
         status[name] = running
     }
+    
+    for name, entryID := range e.taskEntries {
+        scheduled[name] = true
+        scheduleIds[name] = int(entryID)
+    }
 
     return map[string]interface{}{
-        "tasks": status,
+        "tasks":        status,
+        "scheduled":    scheduled,
+        "schedule_ids": scheduleIds,
         "cron_running": e.running,
     }
 }
@@ -243,19 +324,34 @@ func (s *Server) Start(host string, port int) error {
 
 // Stop 停止服务器
 func (s *Server) Stop() error {
+    s.engine.mu.Lock()
+    defer s.engine.mu.Unlock()
+    
     log.Printf("🛑 正在停止SmartCI服务器...")
     
     // 停止Cron调度器
     s.engine.StopCron()
 
     // 停止HTTP服务器
+    var err error
     if s.server != nil {
         ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
         defer cancel()
-        return s.server.Shutdown(ctx)
+        err = s.server.Shutdown(ctx)
     }
     
-    return nil
+    // 发送关闭信号给主程序（防止重复关闭）
+    if s.engine.shutdownChan != nil {
+        select {
+        case <-s.engine.shutdownChan:
+            // channel已经关闭
+        default:
+            close(s.engine.shutdownChan)
+        }
+        s.engine.shutdownChan = nil
+    }
+    
+    return err
 }
 
 // setupRoutes 设置HTTP路由
@@ -340,24 +436,17 @@ func (s *Server) executeCommand(command string, args map[string]interface{}) API
                 Message: "缺少任务名称参数",
             }
         }
-        // 检查任务是否存在
-        found := false
-        for _, task := range s.cfg.BashTasks {
-            if task.Name == taskName {
-                found = true
-                break
-            }
-        }
-        if !found {
+        // 启动任务的周期性调度
+        err := s.engine.StartBashTask(taskName)
+        if err != nil {
             return APIResponse{
                 Success: false,
-                Message: fmt.Sprintf("任务 '%s' 不存在", taskName),
+                Message: err.Error(),
             }
         }
-        go s.engine.TriggerBashTask(taskName)
         return APIResponse{
             Success: true,
-            Message: fmt.Sprintf("任务 '%s' 已启动", taskName),
+            Message: fmt.Sprintf("任务 '%s' 的周期性调度已启动", taskName),
         }
     case "stop":
         taskName, ok := args["task_name"].(string)
@@ -367,10 +456,17 @@ func (s *Server) executeCommand(command string, args map[string]interface{}) API
                 Message: "缺少任务名称参数",
             }
         }
-        // 这里可以实现任务的停止逻辑
+        // 停止任务的周期性调度
+        err := s.engine.StopBashTask(taskName)
+        if err != nil {
+            return APIResponse{
+                Success: false,
+                Message: err.Error(),
+            }
+        }
         return APIResponse{
             Success: true,
-            Message: fmt.Sprintf("任务 '%s' 停止命令已发送", taskName),
+            Message: fmt.Sprintf("任务 '%s' 的周期性调度已停止", taskName),
         }
     case "status":
         taskName, _ := args["task_name"].(string)
@@ -670,9 +766,13 @@ func runServer(cfg config.Config) {
         }
     }()
 
-    // 等待信号
-    <-sigChan
-    log.Printf("📡 接收到停止信号，正在优雅关闭服务器...")
+    // 等待信号或服务器关闭信号
+    select {
+    case <-sigChan:
+        log.Printf("📡 接收到系统停止信号，正在优雅关闭服务器...")
+    case <-server.engine.shutdownChan:
+        log.Printf("📡 接收到服务器关闭命令，正在优雅关闭服务器...")
+    }
 
     // 停止服务器
     if err := server.Stop(); err != nil {
@@ -680,4 +780,7 @@ func runServer(cfg config.Config) {
     } else {
         log.Printf("✅ 服务器已安全停止")
     }
+    
+    // 退出程序
+    os.Exit(0)
 }
