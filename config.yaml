@@ -1,6 +1,18 @@
 # SmartCI 配置文件示例
 # 支持Docker CI/CD流水线和Bash任务调度
 
+# 服务器配置
+server:
+  host: "localhost"
+  port: 8080
+  # 可选：认证密钥
+  auth_token: ""
+  # 可选：TLS配置
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+
 # 大模型配置
 llm_key: "${OPENAI_API_KEY}"
 llm_base: "https://api.openai.com/v1"

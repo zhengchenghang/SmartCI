@@ -3,11 +3,15 @@ package main
 import (
     "context"
     "encoding/json"
+    "flag"
     "fmt"
     "log"
     "net/http"
     "os"
+    "os/signal"
     "sync"
+    "syscall"
+    "time"
 
     cron "github.com/robfig/cron/v3"
 
@@ -22,7 +26,44 @@ type Engine struct {
     executor    core.Executor
     bashExecutor core.BashExecutor
     agent       core.Agent
+    cron        *cron.Cron
     mu          sync.Mutex
+    running     bool
+    taskStatus  map[string]bool // 任务运行状态
+}
+
+type Server struct {
+    engine *Engine
+    cfg    *config.Config
+    server *http.Server
+}
+
+// APIRequest API请求结构
+type APIRequest struct {
+    Command string                 `json:"command"`
+    Args    map[string]interface{} `json:"args"`
+}
+
+// APIResponse API响应结构
+type APIResponse struct {
+    Success bool        `json:"success"`
+    Message string      `json:"message"`
+    Data    interface{} `json:"data,omitempty"`
+}
+
+func NewEngine(cfg config.Config) *Engine {
+    dockerExecutor, _ := executor.NewDockerExecutor("./logs")
+    bashExecutor, _ := executor.NewBashExecutor("./logs")
+    aiAgent := ai.NewAIAgent(cfg.LLMKey, cfg.LLMBase)
+
+    return &Engine{
+        cfg:          cfg,
+        executor:     dockerExecutor,
+        bashExecutor: bashExecutor,
+        agent:        aiAgent,
+        cron:         cron.New(),
+        taskStatus:   make(map[string]bool),
+    }
 }
 
 func (e *Engine) Trigger(repoName, branch string) {
@@ -71,8 +112,16 @@ func (e *Engine) TriggerBashTask(taskName string) {
         return
     }
 
+    e.mu.Lock()
+    e.taskStatus[taskName] = true
+    e.mu.Unlock()
+
     log.Printf("⚙️ 触发Bash任务: %s", taskName)
     logFile, err := e.bashExecutor.RunBashTask(context.Background(), targetTask)
+
+    e.mu.Lock()
+    e.taskStatus[taskName] = false
+    e.mu.Unlock()
 
     if err != nil {
         log.Printf("❌ Bash任务失败: %v", err)
@@ -99,30 +148,320 @@ func (e *Engine) analyzeFailure(logPath string) {
     log.Printf("🤖 AI 分析报告已生成: %s", analysisFile)
 }
 
-// MCPServer 暴露工具给外部 AI (如 Cursor, Claude)
-type MCPServer struct {
-    engine *Engine
-}
+func (e *Engine) StartCron() {
+    // 全局仓库任务调度
+    e.cron.AddFunc(e.cfg.Schedule, func() {
+        for _, r := range e.cfg.Repos {
+            e.Trigger(r.Name, r.Branches[0])
+        }
+    })
 
-// 模拟 MCP 的 Tool 定义结构
-type MCPTool struct {
-    Name        string `json:"name"`
-    Description string `json:"description"`
-    InputSchema any    `json:"input_schema"`
-}
-
-func NewMcpServer(engine *Engine) MCPServer {
-    svr := MCPServer{
-        engine: engine,
+    // Bash任务独立调度
+    for _, task := range e.cfg.BashTasks {
+        if task.Schedule != "" {
+            taskName := task.Name // 创建局部变量避免闭包问题
+            e.cron.AddFunc(task.Schedule, func() {
+                e.TriggerBashTask(taskName)
+            })
+            log.Printf("📅 已注册Bash任务: %s (%s)", taskName, task.Schedule)
+        }
     }
-    svr.engine = engine
-    return svr
+    
+    e.cron.Start()
+    e.running = true
+    log.Printf("✅ Cron调度器已启动")
 }
 
-func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-    // 这是一个极简的 MCP / JSON-RPC 实现
-    // 实际 MCP 需要处理 SSE 或 Stdio，这里用 HTTP 模拟 Tool Call 接口
+func (e *Engine) StopCron() {
+    if e.cron != nil {
+        ctx := e.cron.Stop()
+        select {
+        case <-ctx.Done():
+            log.Printf("✅ Cron调度器已停止")
+        case <-time.After(time.Second * 10):
+            log.Printf("⚠️ Cron调度器停止超时")
+        }
+        e.running = false
+    }
+}
 
+func (e *Engine) GetTaskStatus(taskName string) map[string]interface{} {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+
+    if taskName != "" {
+        status, exists := e.taskStatus[taskName]
+        return map[string]interface{}{
+            "task_name": taskName,
+            "running":   exists && status,
+        }
+    }
+
+    // 返回所有任务状态
+    status := make(map[string]bool)
+    for name, running := range e.taskStatus {
+        status[name] = running
+    }
+
+    return map[string]interface{}{
+        "tasks": status,
+        "cron_running": e.running,
+    }
+}
+
+// NewServer 创建新的服务器实例
+func NewServer(cfg *config.Config) *Server {
+    engine := NewEngine(*cfg)
+    return &Server{
+        engine: engine,
+        cfg:    cfg,
+    }
+}
+
+// Start 启动服务器
+func (s *Server) Start(host string, port int) error {
+    // 创建日志目录
+    os.MkdirAll("./logs", 0755)
+
+    // 启动Cron调度器
+    s.engine.StartCron()
+
+    // 创建HTTP服务器
+    addr := fmt.Sprintf("%s:%d", host, port)
+    s.server = &http.Server{
+        Addr: addr,
+    }
+
+    // 注册路由
+    s.setupRoutes()
+
+    log.Printf("🚀 SmartCI服务器启动在 %s", addr)
+    log.Printf("📋 配置文件加载完成，仓库数量: %d, Bash任务数量: %d", len(s.cfg.Repos), len(s.cfg.BashTasks))
+
+    return s.server.ListenAndServe()
+}
+
+// Stop 停止服务器
+func (s *Server) Stop() error {
+    log.Printf("🛑 正在停止SmartCI服务器...")
+    
+    // 停止Cron调度器
+    s.engine.StopCron()
+
+    // 停止HTTP服务器
+    if s.server != nil {
+        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer cancel()
+        return s.server.Shutdown(ctx)
+    }
+    
+    return nil
+}
+
+// setupRoutes 设置HTTP路由
+func (s *Server) setupRoutes() {
+    // API命令路由
+    http.HandleFunc("/api/command", s.handleCommand)
+    
+    // 兼容性路由
+    http.HandleFunc("/mcp/", s.handleMCP)
+    http.HandleFunc("/webhook", s.handleWebhook)
+    http.HandleFunc("/webhook/bash", s.handleBashWebhook)
+    http.HandleFunc("/config", s.handleConfig)
+    http.HandleFunc("/health", s.handleHealth)
+}
+
+// handleCommand 处理API命令请求
+func (s *Server) handleCommand(w http.ResponseWriter, r *http.Request) {
+    if r.Method != "POST" {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    // 检查认证
+    if s.cfg.Server.AuthToken != "" {
+        authHeader := r.Header.Get("Authorization")
+        if authHeader != "Bearer "+s.cfg.Server.AuthToken {
+            http.Error(w, "Unauthorized", http.StatusUnauthorized)
+            return
+        }
+    }
+
+    var req APIRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        response := APIResponse{
+            Success: false,
+            Message: "解析请求失败: " + err.Error(),
+        }
+        json.NewEncoder(w).Encode(response)
+        return
+    }
+
+    response := s.executeCommand(req.Command, req.Args)
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(response)
+}
+
+// executeCommand 执行命令
+func (s *Server) executeCommand(command string, args map[string]interface{}) APIResponse {
+    switch command {
+    case "server-up":
+        return APIResponse{
+            Success: true,
+            Message: "服务器已在运行",
+        }
+    case "server-down":
+        go func() {
+            time.Sleep(1 * time.Second)
+            s.Stop()
+        }()
+        return APIResponse{
+            Success: true,
+            Message: "服务器正在停止...",
+        }
+    case "run":
+        taskName, ok := args["task_name"].(string)
+        if !ok {
+            return APIResponse{
+                Success: false,
+                Message: "缺少任务名称参数",
+            }
+        }
+        go s.engine.TriggerBashTask(taskName)
+        return APIResponse{
+            Success: true,
+            Message: fmt.Sprintf("任务 '%s' 已启动", taskName),
+        }
+    case "start":
+        taskName, ok := args["task_name"].(string)
+        if !ok {
+            return APIResponse{
+                Success: false,
+                Message: "缺少任务名称参数",
+            }
+        }
+        // 检查任务是否存在
+        found := false
+        for _, task := range s.cfg.BashTasks {
+            if task.Name == taskName {
+                found = true
+                break
+            }
+        }
+        if !found {
+            return APIResponse{
+                Success: false,
+                Message: fmt.Sprintf("任务 '%s' 不存在", taskName),
+            }
+        }
+        go s.engine.TriggerBashTask(taskName)
+        return APIResponse{
+            Success: true,
+            Message: fmt.Sprintf("任务 '%s' 已启动", taskName),
+        }
+    case "stop":
+        taskName, ok := args["task_name"].(string)
+        if !ok {
+            return APIResponse{
+                Success: false,
+                Message: "缺少任务名称参数",
+            }
+        }
+        // 这里可以实现任务的停止逻辑
+        return APIResponse{
+            Success: true,
+            Message: fmt.Sprintf("任务 '%s' 停止命令已发送", taskName),
+        }
+    case "status":
+        taskName, _ := args["task_name"].(string)
+        status := s.engine.GetTaskStatus(taskName)
+        return APIResponse{
+            Success: true,
+            Message: "任务状态查询成功",
+            Data:    status,
+        }
+    case "logs":
+        taskName, ok := args["task_name"].(string)
+        if !ok {
+            return APIResponse{
+                Success: false,
+                Message: "缺少任务名称参数",
+            }
+        }
+        lines, _ := args["lines"].(int)
+        if lines == 0 {
+            lines = 100 // 默认显示100行
+        }
+        // 这里可以实现日志读取逻辑
+        return APIResponse{
+            Success: true,
+            Message: fmt.Sprintf("显示任务 '%s' 的最近 %d 行日志", taskName, lines),
+            Data: map[string]interface{}{
+                "task_name": taskName,
+                "lines":     lines,
+                "content":   "日志内容待实现...",
+            },
+        }
+    case "config":
+        return APIResponse{
+            Success: true,
+            Message: "配置信息",
+            Data: map[string]interface{}{
+                "repos_count":      len(s.cfg.Repos),
+                "bash_tasks_count": len(s.cfg.BashTasks),
+                "schedule":         s.cfg.Schedule,
+                "llm_configured":   s.cfg.LLMKey != "",
+                "server":           s.cfg.Server,
+            },
+        }
+    case "reload":
+        // 这里可以实现配置重新加载逻辑
+        return APIResponse{
+            Success: true,
+            Message: "配置重新加载功能待实现",
+        }
+    case "list":
+        tasks := make([]string, 0, len(s.cfg.BashTasks))
+        for _, task := range s.cfg.BashTasks {
+            tasks = append(tasks, task.Name)
+        }
+        return APIResponse{
+            Success: true,
+            Message: "可用任务列表",
+            Data: map[string]interface{}{
+                "bash_tasks": tasks,
+                "repos":      getRepoNames(s.cfg.Repos),
+            },
+        }
+    case "health":
+        return APIResponse{
+            Success: true,
+            Message: "服务器运行正常",
+            Data: map[string]interface{}{
+                "status":    "healthy",
+                "uptime":    "运行时间待实现",
+                "version":   "1.0.0",
+                "cron_running": s.engine.running,
+            },
+        }
+    default:
+        return APIResponse{
+            Success: false,
+            Message: fmt.Sprintf("未知命令: %s", command),
+        }
+    }
+}
+
+func getRepoNames(repos []config.RepoConfig) []string {
+    names := make([]string, len(repos))
+    for i, repo := range repos {
+        names[i] = repo.Name
+    }
+    return names
+}
+
+// handleMCP 处理MCP兼容请求
+func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
     if r.URL.Path == "/mcp/tools" {
         // 列出可用工具
         tools := []MCPTool{
@@ -178,24 +517,88 @@ func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
             go s.engine.TriggerBashTask(req.Args["task"])
             fmt.Fprintf(w, "Bash task triggered for %s", req.Args["task"])
         case "get_build_logs":
-            // 实现获取日志逻辑
             fmt.Fprintf(w, "Logs content...")
         }
     }
 }
 
-func main() {
-    // 1. 加载配置
-    configFile := "config.yaml"
-    if len(os.Args) > 1 {
-        configFile = os.Args[1]
+// handleWebhook 处理webhook请求
+func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
+    repo := r.URL.Query().Get("repo")
+    branch := r.URL.Query().Get("branch")
+    if repo == "" {
+        repo = "backend-go"
     }
-    
-    cfg, err := config.LoadConfig(configFile)
+    if branch == "" {
+        branch = "main"
+    }
+    s.engine.Trigger(repo, branch)
+    w.Write([]byte("OK"))
+}
+
+// handleBashWebhook 处理bash任务webhook请求
+func (s *Server) handleBashWebhook(w http.ResponseWriter, r *http.Request) {
+    taskName := r.URL.Query().Get("task")
+    if taskName == "" {
+        http.Error(w, "Missing task parameter", http.StatusBadRequest)
+        return
+    }
+    s.engine.TriggerBashTask(taskName)
+    w.Write([]byte("Bash task triggered"))
+}
+
+// handleConfig 处理配置查看请求
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    summary := map[string]interface{}{
+        "repos_count":      len(s.cfg.Repos),
+        "bash_tasks_count": len(s.cfg.BashTasks),
+        "schedule":         s.cfg.Schedule,
+        "llm_configured":   s.cfg.LLMKey != "",
+        "server":           s.cfg.Server,
+    }
+    json.NewEncoder(w).Encode(summary)
+}
+
+// handleHealth 处理健康检查请求
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    status := map[string]interface{}{
+        "status":       "healthy",
+        "version":      "1.0.0",
+        "cron_running": s.engine.running,
+        "uptime":       "运行时间待实现",
+    }
+    json.NewEncoder(w).Encode(status)
+}
+
+// MCPTool MCP工具定义结构
+type MCPTool struct {
+    Name        string `json:"name"`
+    Description string `json:"description"`
+    InputSchema any    `json:"input_schema"`
+}
+
+func main() {
+    // 解析命令行参数
+    var (
+        configFile = flag.String("config", "config.yaml", "配置文件路径")
+        mode       = flag.String("mode", "server", "运行模式: server 或 client")
+        host       = flag.String("host", "", "服务器主机地址（覆盖配置文件）")
+        port       = flag.Int("port", 0, "服务器端口（覆盖配置文件）")
+    )
+    flag.Parse()
+
+    // 加载配置
+    cfg, err := config.LoadConfig(*configFile)
     if err != nil {
         log.Printf("⚠️  加载配置文件失败: %v，使用默认配置", err)
         // 使用默认配置
         cfg = config.Config{
+            Server: config.ServerConfig{
+                Host: "localhost",
+                Port: 8080,
+            },
             Repos: []config.RepoConfig{
                 {
                     Name:        "backend-go",
@@ -210,7 +613,7 @@ func main() {
                 {
                     Name:        "backup-database",
                     Description: "备份数据库",
-                    Schedule:    "0 2 * * *", // 每天凌晨2点
+                    Schedule:    "0 2 * * *",
                     Command:     "pg_dump mydb > backup_$(date +%Y%m%d_%H%M%S).sql",
                     WorkingDir:  "/backups",
                     Timeout:     600,
@@ -219,7 +622,7 @@ func main() {
                 {
                     Name:        "cleanup-logs",
                     Description: "清理旧日志文件",
-                    Schedule:    "0 0 * * 0", // 每周日午夜
+                    Schedule:    "0 0 * * 0",
                     Command:     "find ./logs -name '*.log' -mtime +7 -delete",
                     WorkingDir:  "/home/engine/project",
                     Timeout:     300,
@@ -231,88 +634,50 @@ func main() {
         }
     }
 
-    // 创建日志目录
-    os.MkdirAll("./logs", 0755)
-
-    dockerExecutor, _ := executor.NewDockerExecutor("./logs")
-    bashExecutor, _ := executor.NewBashExecutor("./logs")
-    aiAgent := ai.NewAIAgent(cfg.LLMKey, cfg.LLMBase)
-
-    engine := &Engine{
-        cfg:          cfg,
-        executor:     dockerExecutor,
-        bashExecutor: bashExecutor,
-        agent:        aiAgent,
+    // 覆盖配置文件中的服务器设置
+    if *host != "" {
+        cfg.Server.Host = *host
+    }
+    if *port != 0 {
+        cfg.Server.Port = *port
     }
 
-    // 2. 启动 Cron - 全局调度
-    c := cron.New()
-    
-    // 全局仓库任务调度
-    c.AddFunc(cfg.Schedule, func() {
-        for _, r := range cfg.Repos {
-            engine.Trigger(r.Name, r.Branches[0])
-        }
-    })
-
-    // Bash任务独立调度
-    for _, task := range cfg.BashTasks {
-        if task.Schedule != "" {
-            taskName := task.Name // 创建局部变量避免闭包问题
-            c.AddFunc(task.Schedule, func() {
-                engine.TriggerBashTask(taskName)
-            })
-            log.Printf("📅 已注册Bash任务: %s (%s)", taskName, task.Schedule)
-        }
+    switch *mode {
+    case "server":
+        runServer(cfg)
+    case "client":
+        log.Printf("❌ 客户端模式请使用 ./client 可执行文件")
+        os.Exit(1)
+    default:
+        log.Printf("❌ 未知模式: %s，支持的模式: server, client", *mode)
+        os.Exit(1)
     }
-    
-    c.Start()
+}
 
-    // 3. 启动 MCP / Webhook 服务器
-    mcpServer := &MCPServer{
-        engine: engine,
+func runServer(cfg config.Config) {
+    // 创建服务器实例
+    server := NewServer(&cfg)
+
+    // 设置信号处理
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+    // 在goroutine中启动服务器
+    go func() {
+        if err := server.Start(cfg.Server.Host, cfg.Server.Port); err != nil && err != http.ErrServerClosed {
+            log.Printf("❌ 服务器启动失败: %v", err)
+            os.Exit(1)
+        }
+    }()
+
+    // 等待信号
+    <-sigChan
+    log.Printf("📡 接收到停止信号，正在优雅关闭服务器...")
+
+    // 停止服务器
+    if err := server.Stop(); err != nil {
+        log.Printf("❌ 服务器停止失败: %v", err)
+    } else {
+        log.Printf("✅ 服务器已安全停止")
     }
-    http.Handle("/mcp/", mcpServer)
-    http.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
-        // 简单的 Webhook 触发逻辑
-        repo := r.URL.Query().Get("repo")
-        branch := r.URL.Query().Get("branch")
-        if repo == "" {
-            repo = "backend-go"
-        }
-        if branch == "" {
-            branch = "main"
-        }
-        engine.Trigger(repo, branch)
-        w.Write([]byte("OK"))
-    })
-
-    // 添加bash任务webhook触发
-    http.HandleFunc("/webhook/bash", func(w http.ResponseWriter, r *http.Request) {
-        taskName := r.URL.Query().Get("task")
-        if taskName == "" {
-            http.Error(w, "Missing task parameter", http.StatusBadRequest)
-            return
-        }
-        engine.TriggerBashTask(taskName)
-        w.Write([]byte("Bash task triggered"))
-    })
-
-    // 添加配置查看端点
-    http.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Content-Type", "application/json")
-        // 返回配置摘要，不包含敏感信息
-        summary := map[string]interface{}{
-            "repos_count":      len(cfg.Repos),
-            "bash_tasks_count": len(cfg.BashTasks),
-            "schedule":         cfg.Schedule,
-            "llm_configured":   cfg.LLMKey != "",
-        }
-        json.NewEncoder(w).Encode(summary)
-    })
-
-    log.Printf("SmartCI is running on :8080 (Cron + Webhook + MCP + Bash Tasks)")
-    log.Printf("配置文件: %s", configFile)
-    log.Printf("仓库数量: %d, Bash任务数量: %d", len(cfg.Repos), len(cfg.BashTasks))
-    http.ListenAndServe(":8080", nil)
 }
