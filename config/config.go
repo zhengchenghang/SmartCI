@@ -3,11 +3,27 @@ package config
 // ================= 配置定义 =================
 
 type Config struct {
-    LLMKey    string         `yaml:"llm_key"`    // 大模型 API Key
-    LLMBase   string         `yaml:"llm_base"`   // 大模型 Base URL
-    Schedule  string         `yaml:"schedule"`   // 全局定时
-    Repos     []RepoConfig   `yaml:"repos"`      // 仓库配置
+    Server    ServerConfig    `yaml:"server"`     // 服务器配置
+    LLMKey    string           `yaml:"llm_key"`    // 大模型 API Key
+    LLMBase   string           `yaml:"llm_base"`   // 大模型 Base URL
+    Schedule  string           `yaml:"schedule"`   // 全局定时
+    Repos     []RepoConfig     `yaml:"repos"`      // 仓库配置
     BashTasks []BashTaskConfig `yaml:"bash_tasks"` // Bash任务配置
+}
+
+// ServerConfig 服务器配置
+type ServerConfig struct {
+    Host      string   `yaml:"host"`       // 服务器主机
+    Port      int      `yaml:"port"`       // 服务器端口
+    AuthToken string   `yaml:"auth_token"` // 认证令牌
+    TLS       TLSConfig `yaml:"tls"`       // TLS配置
+}
+
+// TLSConfig TLS配置
+type TLSConfig struct {
+    Enabled  bool   `yaml:"enabled"`  // 是否启用TLS
+    CertFile string `yaml:"cert_file"` // 证书文件路径
+    KeyFile  string `yaml:"key_file"`  // 私钥文件路径
 }
 
 type RepoConfig struct {
