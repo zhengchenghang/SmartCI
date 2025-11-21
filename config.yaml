@@ -1,5 +1,5 @@
 # SmartCI 配置文件示例
-# 支持Docker CI/CD流水线和Bash任务调度
+# 支持Docker CI/CD流水线、Bash任务调度、OAuth授权和Webhook监听
 
 # 服务器配置
 server:
@@ -12,6 +12,82 @@ server:
     enabled: false
     cert_file: ""
     key_file: ""
+
+# OAuth配置
+oauth:
+  # GitHub OAuth配置
+  - name: "github"
+    client_id: "${GITHUB_CLIENT_ID}"
+    client_secret: "${GITHUB_CLIENT_SECRET}"
+    redirect_url: "http://localhost:8080/oauth/callback?provider=github"
+    scopes:
+      - "repo"
+      - "read:user"
+      - "admin:repo_hook"
+
+  # GitLab OAuth配置（示例）
+  # - name: "gitlab"
+  #   client_id: "${GITLAB_CLIENT_ID}"
+  #   client_secret: "${GITLAB_CLIENT_SECRET}"
+  #   redirect_url: "http://localhost:8080/oauth/callback?provider=gitlab"
+  #   scopes:
+  #     - "api"
+  #     - "read_user"
+
+# Webhook配置
+webhooks:
+  # GitHub push事件webhook
+  - name: "github-push-deploy"
+    path: "/webhook/github/push"
+    provider: "github"
+    secret: "${GITHUB_WEBHOOK_SECRET}"
+    events:
+      - "push"
+      - "pull_request"
+    filters:
+      branches:
+        - "main"
+        - "develop"
+      actions:
+        - "opened"
+        - "synchronize"
+    actions:
+      # 执行部署任务
+      - type: "task"
+        task: "deploy-app"
+      # 执行测试命令
+      - type: "command"
+        command: "echo 'Running tests for ${GITHUB_REF}' && npm test"
+        working_dir: "/home/engine/project"
+        timeout: 600
+
+  # GitHub release事件webhook
+  - name: "github-release"
+    path: "/webhook/github/release"
+    provider: "github"
+    secret: "${GITHUB_WEBHOOK_SECRET}"
+    events:
+      - "release"
+    filters:
+      actions:
+        - "published"
+    actions:
+      # 执行发布脚本
+      - type: "script"
+        script: "./scripts/release.sh"
+        working_dir: "/home/engine/project"
+        timeout: 1800
+        env:
+          RELEASE_TYPE: "production"
+
+  # 通用webhook（无认证）
+  - name: "manual-trigger"
+    path: "/webhook/manual"
+    events:
+      - "*"
+    actions:
+      - type: "task"
+        task: "backup-database"
 
 # 大模型配置
 llm_key: "${OPENAI_API_KEY}"
