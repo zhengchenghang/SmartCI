@@ -1,0 +1,184 @@
+# SmartCI 配置文件示例
+# 支持Docker CI/CD流水线、Bash任务调度、OAuth授权和Webhook监听
+
+# 服务器配置
+server:
+  host: "localhost"
+  port: 8080
+  # 可选：认证密钥
+  auth_token: ""
+  # 可选：TLS配置
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+
+# OAuth配置
+oauth:
+  # GitHub OAuth配置
+  - name: "github"
+    client_id: "${GITHUB_CLIENT_ID}"
+    client_secret: "${GITHUB_CLIENT_SECRET}"
+    redirect_url: "http://localhost:8080/oauth/callback?provider=github"
+    scopes:
+      - "repo"
+      - "read:user"
+      - "admin:repo_hook"
+
+  # GitLab OAuth配置（示例）
+  # - name: "gitlab"
+  #   client_id: "${GITLAB_CLIENT_ID}"
+  #   client_secret: "${GITLAB_CLIENT_SECRET}"
+  #   redirect_url: "http://localhost:8080/oauth/callback?provider=gitlab"
+  #   scopes:
+  #     - "api"
+  #     - "read_user"
+
+# Webhook配置
+webhooks:
+  # GitHub push事件webhook
+  - name: "github-push-deploy"
+    path: "/webhook/github/push"
+    provider: "github"
+    secret: "${GITHUB_WEBHOOK_SECRET}"
+    events:
+      - "push"
+      - "pull_request"
+    filters:
+      branches:
+        - "main"
+        - "develop"
+      actions:
+        - "opened"
+        - "synchronize"
+    actions:
+      # 执行部署任务
+      - type: "task"
+        task: "deploy-app"
+      # 执行测试命令
+      - type: "command"
+        command: "echo 'Running tests for ${GITHUB_REF}' && npm test"
+        working_dir: "/home/engine/project"
+        timeout: 600
+
+  # GitHub release事件webhook
+  - name: "github-release"
+    path: "/webhook/github/release"
+    provider: "github"
+    secret: "${GITHUB_WEBHOOK_SECRET}"
+    events:
+      - "release"
+    filters:
+      actions:
+        - "published"
+    actions:
+      # 执行发布脚本
+      - type: "script"
+        script: "./scripts/release.sh"
+        working_dir: "/home/engine/project"
+        timeout: 1800
+        env:
+          RELEASE_TYPE: "production"
+
+  # 通用webhook（无认证）
+  - name: "manual-trigger"
+    path: "/webhook/manual"
+    events:
+      - "*"
+    actions:
+      - type: "task"
+        task: "backup-database"
+
+# 大模型配置
+llm_key: "${OPENAI_API_KEY}"
+llm_base: "https://api.openai.com/v1"
+
+# 全局定时调度（可选）
+schedule: "@every 30m"
+
+# 仓库CI/CD配置
+repos:
+  - name: "backend-go"
+    url: "https://github.com/user/backend"
+    branches: ["main", "develop"]
+    dockerfile: "Dockerfile"
+    test_cmd: "go test ./..."
+    auto_analyze: true
+
+  - name: "frontend-react"
+    url: "https://github.com/user/frontend"
+    branches: ["main"]
+    dockerfile: "Dockerfile"
+    test_cmd: "npm run test"
+    auto_analyze: true
+
+# Bash任务调度配置
+bash_tasks:
+  # 数据库备份任务
+  - name: "backup-database"
+    description: "每日凌晨备份数据库"
+    schedule: "0 2 * * *"  # 每天凌晨2点执行
+    command: |
+      # 创建备份目录
+      mkdir -p /backups/$(date +%Y%m%d)
+      # 备份数据库
+      pg_dump mydb | gzip > /backups/$(date +%Y%m%d)/backup_$(date +%Y%m%d_%H%M%S).sql.gz
+      # 清理7天前的备份
+      find /backups -name "*.sql.gz" -mtime +7 -delete
+      echo "数据库备份完成"
+    working_dir: "/tmp"
+    timeout: 1800  # 30分钟超时
+    auto_analyze: true
+
+  # 日志清理任务
+  - name: "cleanup-logs"
+    description: "每周清理旧日志文件"
+    schedule: "0 0 * * 0"  # 每周日午夜执行
+    command: "find ./logs -name '*.log' -mtime +7 -delete && echo '日志清理完成'"
+    working_dir: "/home/engine/project"
+    timeout: 300
+    auto_analyze: false
+
+  # 系统监控任务
+  - name: "system-monitor"
+    description: "每5分钟检查系统状态"
+    schedule: "*/5 * * * *"  # 每5分钟执行
+    command: |
+      # 检查磁盘使用率
+      df -h | grep -E "/$|/home" | awk '{print $5}' | sed 's/%//' | while read usage; do
+        if [ $usage -gt 80 ]; then
+          echo "警告: 磁盘使用率超过80%: ${usage}%"
+        fi
+      done
+      
+      # 检查内存使用率
+      free | grep Mem | awk '{printf "%.2f\n", $3/$2 * 100.0}' | while read usage; do
+        if (( $(echo "$usage > 80" | bc -l) )); then
+          echo "警告: 内存使用率超过80%: ${usage}%"
+        fi
+      done
+      
+      echo "系统监控检查完成"
+    timeout: 60
+    auto_analyze: true
+
+  # 使用脚本文件的示例
+  - name: "deploy-app"
+    description: "应用部署脚本"
+    schedule: "0 6 * * 1,3,5"  # 周一、三、五早上6点
+    script_file: "./scripts/deploy.sh"  # 指向脚本文件
+    working_dir: "/home/engine/project"
+    timeout: 600
+    auto_analyze: true
+
+  # 数据同步任务
+  - name: "sync-data"
+    description: "同步远程数据"
+    schedule: "0 */4 * * *"  # 每4小时执行一次
+    command: |
+      # 同步数据脚本
+      rsync -av --delete user@remote:/data/ /local/data/
+      echo "数据同步完成"
+    working_dir: "/local/data"
+    timeout: 1200
+    auto_analyze: false
