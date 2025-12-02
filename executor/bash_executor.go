@@ -5,6 +5,7 @@ import (
     "fmt"
     "io"
     "lite-cicd/config"
+    "lite-cicd/core"
     "log"
     "os"
     "os/exec"
@@ -21,25 +22,44 @@ func NewBashExecutor(logDir string) (*BashExecutor, error) {
     return &BashExecutor{logDir: logDir}, nil
 }
 
-func (e *BashExecutor) RunBashTask(ctx context.Context, task config.BashTaskConfig) (string, error) {
-    // 生成日志文件路径
-    logFile := filepath.Join(e.logDir, fmt.Sprintf("bash-%s-%d.log", task.Name, time.Now().Unix()))
+func (e *BashExecutor) RunBashTask(ctx context.Context, task config.BashTaskConfig) (*core.TaskResult, error) {
+    // 生成任务ID
+    taskID := core.GenerateTaskID()
+    
+    // 创建任务目录
+    taskDir, err := core.CreateTaskDir(e.logDir, taskID)
+    if err != nil {
+        return nil, fmt.Errorf("创建任务目录失败: %v", err)
+    }
+    
+    // 生成日志文件路径（在任务目录中）
+    logFile := filepath.Join(taskDir, "task.log")
+    
+    result := &core.TaskResult{
+        TaskID:  taskID,
+        TaskDir: taskDir,
+        LogFile: logFile,
+    }
+    
+    log.Printf("🔧 [Bash] 任务ID: %s", taskID)
+    log.Printf("📁 [Bash] 任务目录: %s", taskDir)
     
     // 确定要执行的命令
     var command string
-    var err error
     
     if task.ScriptFile != "" {
         // 从文件读取脚本
         command, err = e.readScriptFile(task.ScriptFile)
         if err != nil {
-            return "", fmt.Errorf("读取脚本文件失败: %v", err)
+            result.Error = fmt.Errorf("读取脚本文件失败: %v", err)
+            return result, result.Error
         }
     } else if task.Command != "" {
         // 使用内联命令
         command = task.Command
     } else {
-        return "", fmt.Errorf("未指定命令或脚本文件")
+        result.Error = fmt.Errorf("未指定命令或脚本文件")
+        return result, result.Error
     }
 
     // 设置超时
@@ -65,11 +85,12 @@ func (e *BashExecutor) RunBashTask(ctx context.Context, task config.BashTaskConf
 
     err = e.runBashCommand(ctx, command, task.WorkingDir, logFile)
     if err != nil {
-        return logFile, fmt.Errorf("bash任务执行失败: %v", err)
+        result.Error = fmt.Errorf("bash任务执行失败: %v", err)
+        return result, result.Error
     }
 
     log.Printf("✅ [Bash] 任务完成: %s", task.Name)
-    return logFile, nil
+    return result, nil
 }
 
 func (e *BashExecutor) readScriptFile(scriptFile string) (string, error) {
