@@ -103,7 +103,16 @@ repos:
     branches: ["main", "develop"]
     dockerfile: "Dockerfile"
     test_cmd: "go test ./..."
-    auto_analyze: true
+    auto_analyze: true  # 旧的配置方式（兼容）
+    # 新的AI配置方式
+    ai:
+      enabled: true
+      context:
+        - "log"           # 预定义类型：任务日志
+        - "*.log"         # 路径通配符：匹配任务目录下的所有.log文件
+        - "coverage/**/*" # 递归通配符：匹配coverage目录下的所有文件
+      prompt: "分析这次Go项目的测试结果，找出失败原因并给出修复建议"
+      output_file: "ai-report.md"  # 可选，默认为 ai-analysis.md
 
   - name: "frontend-react"
     url: "https://github.com/user/frontend"
@@ -128,7 +137,15 @@ bash_tasks:
       echo "数据库备份完成"
     working_dir: "/tmp"
     timeout: 1800  # 30分钟超时
-    auto_analyze: true
+    auto_analyze: true  # 旧的配置方式（兼容）
+    # 新的AI配置方式（失败时自动分析）
+    ai:
+      enabled: true
+      context:
+        - "log"              # 任务日志
+        - "/backups/**/*.log" # 备份过程中产生的日志文件
+      prompt: "分析数据库备份任务的执行情况，如果失败请给出原因和解决方案"
+      output_file: "backup-analysis.md"
 
   # 日志清理任务
   - name: "cleanup-logs"

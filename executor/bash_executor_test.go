@@ -28,18 +28,27 @@ func TestBashExecutor(t *testing.T) {
             Timeout:     10,
         }
 
-        logFile, err := executor.RunBashTask(context.Background(), task)
+        result, err := executor.RunBashTask(context.Background(), task)
         if err != nil {
             t.Fatalf("执行bash任务失败: %v", err)
         }
 
+        // 检查结果
+        if result == nil {
+            t.Fatalf("任务结果为空")
+        }
+
+        if result.TaskID == "" {
+            t.Fatalf("任务ID为空")
+        }
+
         // 检查日志文件是否存在
-        if _, err := os.Stat(logFile); os.IsNotExist(err) {
-            t.Fatalf("日志文件不存在: %s", logFile)
+        if _, err := os.Stat(result.LogFile); os.IsNotExist(err) {
+            t.Fatalf("日志文件不存在: %s", result.LogFile)
         }
 
         // 读取日志内容
-        content, err := os.ReadFile(logFile)
+        content, err := os.ReadFile(result.LogFile)
         if err != nil {
             t.Fatalf("读取日志文件失败: %v", err)
         }
@@ -71,18 +80,23 @@ echo "脚本执行完成"
             Timeout:     10,
         }
 
-        logFile, err := executor.RunBashTask(context.Background(), task)
+        result, err := executor.RunBashTask(context.Background(), task)
         if err != nil {
             t.Fatalf("执行bash任务失败: %v", err)
         }
 
+        // 检查结果
+        if result == nil {
+            t.Fatalf("任务结果为空")
+        }
+
         // 检查日志文件是否存在
-        if _, err := os.Stat(logFile); os.IsNotExist(err) {
-            t.Fatalf("日志文件不存在: %s", logFile)
+        if _, err := os.Stat(result.LogFile); os.IsNotExist(err) {
+            t.Fatalf("日志文件不存在: %s", result.LogFile)
         }
 
         // 读取日志内容
-        content, err := os.ReadFile(logFile)
+        content, err := os.ReadFile(result.LogFile)
         if err != nil {
             t.Fatalf("读取日志文件失败: %v", err)
         }
@@ -104,13 +118,13 @@ echo "脚本执行完成"
             Timeout:     10,
         }
 
-        logFile, err := executor.RunBashTask(context.Background(), task)
+        result, err := executor.RunBashTask(context.Background(), task)
         if err != nil {
             t.Fatalf("执行bash任务失败: %v", err)
         }
 
         // 读取日志内容
-        content, err := os.ReadFile(logFile)
+        content, err := os.ReadFile(result.LogFile)
         if err != nil {
             t.Fatalf("读取日志文件失败: %v", err)
         }
