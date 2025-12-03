@@ -6,6 +6,7 @@ import (
     "io"
     "lite-cicd/config"
     "lite-cicd/core"
+    "lite-cicd/metrics"
     "log"
     "os"
     "os/exec"
@@ -41,6 +42,22 @@ func (e *BashExecutor) RunBashTask(ctx context.Context, task config.BashTaskConf
         LogFile: logFile,
     }
     
+    // 创建元数据记录
+    metadata := &metrics.TaskMetadata{
+        TaskID:    taskID,
+        TaskName:  task.Name,
+        TaskType:  "bash",
+        StartTime: time.Now(),
+        LogFile:   logFile,
+        TaskDir:   taskDir,
+        Config: map[string]interface{}{
+            "command":     task.Command,
+            "script_file": task.ScriptFile,
+            "working_dir": task.WorkingDir,
+            "timeout":     task.Timeout,
+        },
+    }
+    
     log.Printf("🔧 [Bash] 任务ID: %s", taskID)
     log.Printf("📁 [Bash] 任务目录: %s", taskDir)
     
@@ -52,6 +69,11 @@ func (e *BashExecutor) RunBashTask(ctx context.Context, task config.BashTaskConf
         command, err = e.readScriptFile(task.ScriptFile)
         if err != nil {
             result.Error = fmt.Errorf("读取脚本文件失败: %v", err)
+            metadata.EndTime = time.Now()
+            metadata.Duration = metadata.EndTime.Sub(metadata.StartTime).Seconds()
+            metadata.Status = "failure"
+            metadata.Error = result.Error.Error()
+            metrics.SaveMetadata(metadata)
             return result, result.Error
         }
     } else if task.Command != "" {
@@ -59,6 +81,11 @@ func (e *BashExecutor) RunBashTask(ctx context.Context, task config.BashTaskConf
         command = task.Command
     } else {
         result.Error = fmt.Errorf("未指定命令或脚本文件")
+        metadata.EndTime = time.Now()
+        metadata.Duration = metadata.EndTime.Sub(metadata.StartTime).Seconds()
+        metadata.Status = "failure"
+        metadata.Error = result.Error.Error()
+        metrics.SaveMetadata(metadata)
         return result, result.Error
     }
 
@@ -84,11 +111,22 @@ func (e *BashExecutor) RunBashTask(ctx context.Context, task config.BashTaskConf
     }
 
     err = e.runBashCommand(ctx, command, task.WorkingDir, logFile)
+    
+    // 更新元数据
+    metadata.EndTime = time.Now()
+    metadata.Duration = metadata.EndTime.Sub(metadata.StartTime).Seconds()
+    
     if err != nil {
         result.Error = fmt.Errorf("bash任务执行失败: %v", err)
+        metadata.Status = "failure"
+        metadata.Error = result.Error.Error()
+        metrics.SaveMetadata(metadata)
         return result, result.Error
     }
 
+    metadata.Status = "success"
+    metrics.SaveMetadata(metadata)
+    
     log.Printf("✅ [Bash] 任务完成: %s", task.Name)
     return result, nil
 }

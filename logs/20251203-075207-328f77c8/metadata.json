@@ -1,0 +1,18 @@
+{
+  "task_id": "20251203-075207-328f77c8",
+  "task_name": "test-metrics-success",
+  "task_type": "bash",
+  "start_time": "2025-12-03T07:52:07.30426031Z",
+  "end_time": "2025-12-03T07:52:09.33218497Z",
+  "duration": 2.027924604,
+  "status": "success",
+  "error": "",
+  "log_file": "logs/20251203-075207-328f77c8/task.log",
+  "task_dir": "logs/20251203-075207-328f77c8",
+  "config": {
+    "command": "echo \"开始执行任务...\"\nsleep 2\necho \"任务执行完成\"\nexit 0\n",
+    "script_file": "",
+    "timeout": 30,
+    "working_dir": ""
+  }
+}
