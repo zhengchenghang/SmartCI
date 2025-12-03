@@ -1,0 +1,18 @@
+{
+  "task_id": "20251203-075203-8177da05",
+  "task_name": "test-metrics-failure",
+  "task_type": "bash",
+  "start_time": "2025-12-03T07:52:03.214029291Z",
+  "end_time": "2025-12-03T07:52:04.243098181Z",
+  "duration": 1.029068892,
+  "status": "failure",
+  "error": "bash任务执行失败: exit status 1",
+  "log_file": "logs/20251203-075203-8177da05/task.log",
+  "task_dir": "logs/20251203-075203-8177da05",
+  "config": {
+    "command": "echo \"开始执行任务...\"\nsleep 1\necho \"任务执行失败\"\nexit 1\n",
+    "script_file": "",
+    "timeout": 30,
+    "working_dir": ""
+  }
+}

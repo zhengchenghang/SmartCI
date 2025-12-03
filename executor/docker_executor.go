@@ -6,11 +6,13 @@ import (
     "io"
     "lite-cicd/config"
     "lite-cicd/core"
+    "lite-cicd/metrics"
     "log"
     "os"
     "os/exec"
     "path/filepath"
     "strings"
+    "time"
 
     "github.com/docker/docker/api/types"
     "github.com/docker/docker/api/types/container"
@@ -52,6 +54,22 @@ func (e *DockerExecutor) Run(ctx context.Context, repo config.RepoConfig, branch
         LogFile: logFile,
     }
     
+    // 创建元数据记录
+    metadata := &metrics.TaskMetadata{
+        TaskID:    taskID,
+        TaskName:  repo.Name,
+        TaskType:  "repo",
+        StartTime: time.Now(),
+        LogFile:   logFile,
+        TaskDir:   taskDir,
+        Config: map[string]interface{}{
+            "url":        repo.URL,
+            "branch":     branch,
+            "dockerfile": repo.Dockerfile,
+            "test_cmd":   repo.TestCmd,
+        },
+    }
+    
     log.Printf("🐳 [Docker] 任务ID: %s", taskID)
     log.Printf("📁 [Docker] 任务目录: %s", taskDir)
     
@@ -61,6 +79,11 @@ func (e *DockerExecutor) Run(ctx context.Context, repo config.RepoConfig, branch
     log.Printf("📥 [Git] 拉取代码: %s (%s)", repo.Name, branch)
     if err := e.syncCode(repo.URL, branch, workDir); err != nil {
         result.Error = fmt.Errorf("git sync failed: %v", err)
+        metadata.EndTime = time.Now()
+        metadata.Duration = metadata.EndTime.Sub(metadata.StartTime).Seconds()
+        metadata.Status = "failure"
+        metadata.Error = result.Error.Error()
+        metrics.SaveMetadata(metadata)
         return result, result.Error
     }
 
@@ -69,15 +92,31 @@ func (e *DockerExecutor) Run(ctx context.Context, repo config.RepoConfig, branch
     log.Printf("🐳 [Docker] 构建镜像: %s", tag)
     if err := e.buildImage(workDir, repo.Dockerfile, tag); err != nil {
         result.Error = fmt.Errorf("build failed: %v", err)
+        metadata.EndTime = time.Now()
+        metadata.Duration = metadata.EndTime.Sub(metadata.StartTime).Seconds()
+        metadata.Status = "failure"
+        metadata.Error = result.Error.Error()
+        metrics.SaveMetadata(metadata)
         return result, result.Error
     }
 
     // 3. Run Test
     log.Printf("🚀 [Test] 运行测试...")
     err = e.runContainer(ctx, tag, repo.TestCmd, logFile)
+    
+    // 更新元数据
+    metadata.EndTime = time.Now()
+    metadata.Duration = metadata.EndTime.Sub(metadata.StartTime).Seconds()
+    
     if err != nil {
         result.Error = err
+        metadata.Status = "failure"
+        metadata.Error = result.Error.Error()
+    } else {
+        metadata.Status = "success"
     }
+    
+    metrics.SaveMetadata(metadata)
 
     return result, err
 }
