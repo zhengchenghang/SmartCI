@@ -84,10 +84,10 @@ webhooks:
 bash_tasks:
   - name: "hotel-be-e2e-test"
     description: "定时hotel-be e2e测试"
-    schedule: "*/5 * * * *"  # 每10分钟执行一次
+    schedule: "0 */1 * * *"  # 每6小时执行一次
     command: |
       echo "hotel-be e2e 测试开始"
-      bash ./hotel-be-e2e-test.sh feat/auto-e2e-test
+      bash ./hotel-be-e2e-test.sh master
       echo "hotel-be e2e 测试结束"
     working_dir: "."
     timeout: 1800  # 30分钟超时
